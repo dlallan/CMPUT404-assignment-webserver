@@ -1,7 +1,8 @@
 import socketserver
-from typing import Optional
-
+from http import HTTPStatus
+from typing import Optional, Tuple
 from charset_normalizer import logging
+from urllib.parse import urlparse
 #  coding: utf-8
 
 # Copyright 2022 Dillon Allan
@@ -33,18 +34,52 @@ from charset_normalizer import logging
 
 class HttpServer():
     '''A web server supporting a subset of the RFC 2616 HTTP/1.1 specification.'''
+    ENCODING = 'UTF-8'
+    HTTP_VERSION = b'HTTP/1.1'
+    SUPPORTED_HTTP_VERSIONS = (HTTP_VERSION, b'HTTP/1.0')
     CRLF = b'\r\n'
     CRLF_CRLF = CRLF*2
     SP = b' '
     COLON = b':'
-    METHOD = b'OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT'
-    REQUEST_URI = ""
-    # HTTP_VERSION = ...
-    # REQUEST_LINE = bytes(METHOD, SP, REQUEST_URI, SP, HTTP_VERSION, CRLF)
+
+    class HttpResponse:
+        '''Helper class for crafting responses based on the design of HttpServer.'''
+
+        def __init__(self):
+            self.__logger = logging.getLogger(HttpServer.HttpResponse.__name__)
+            self.__encoding = HttpServer.ENCODING
+            self.__header = {'Connection': 'close'}
+            self.__body = b''
+
+        def set_status(self, status: HTTPStatus) -> 'HttpResponse':
+            self.__status_parts = [
+                bytes(str(status.value), self.__encoding),
+                bytes(status.phrase, self.__encoding)
+            ]
+            return self
+
+        def to_bytes(self) -> bytes:
+            response_line = HttpServer.SP.join(
+                [HttpServer.HTTP_VERSION, *self.__status_parts])
+
+            header_bytes = HttpServer.CRLF.join(
+                [bytes(f'{name}: {val}', encoding=HttpServer.ENCODING)
+                 for name, val in self.__header.items()]
+            )
+
+            response_bytes = HttpServer.CRLF.join(
+                [response_line, header_bytes, self.__body])
+
+            self.__logger.debug(f'Response:\n{response_bytes}')
+            return response_bytes
 
     def __init__(self, client_data: bytes):
         self.__logger = logging.getLogger(HttpServer.__name__)
         self.__client_data = client_data
+        self.__method_handlers = {
+            b'GET': self.__handle_get
+        }
+        self.__response = self.HttpResponse()
 
     def handle(self) -> bytes:
         '''
@@ -52,55 +87,94 @@ class HttpServer():
         a) invalid, or
         b) not compatible with the server (which is not fully HTTP/1.1 compliant.)
         '''
-        response = b''
-
-        # Empty requests are invalid
+        # Empty requests are ignored
         if not self.__client_data:
-            response = self.CRLF.join(
-                (b'HTTP/1.1 400 Bad message syntax', self.CRLF))
-            return response
+            return b''
 
         request_and_possibly_body = self.__client_data.lstrip(
             self.CRLF).split(self.CRLF_CRLF)
 
         # Improper use of CRLF is not allowed
         if len(request_and_possibly_body) > 2:
-            response = self.CRLF.join(
-                (b'HTTP/1.1 400 Bad message syntax', self.CRLF))
-            return response
+            return self.__response.set_status(HTTPStatus.BAD_REQUEST).to_bytes()
 
-        return self.__handle_request(*request_and_possibly_body)
+        return self.__handle_request(*request_and_possibly_body).to_bytes()
 
-    def __handle_request(self, request: bytes, body: Optional[bytes] = None) -> bytes:
-        self.__logger.debug(
-            f'Handling request:\n{request}\nwith body:\n{body}')
-        response = b''
+    def __handle_request(self, request: bytes, body: Optional[bytes] = None) -> 'HttpResponse':
         request_line = b''
         header = {}
         request_line_and_possibly_headers = request.split(
             self.CRLF, maxsplit=1)
 
-        # Parse header (if any)
+        # Check header
         if len(request_line_and_possibly_headers) == 2:
-            request_line, header_entries = request_line_and_possibly_headers
+            request_line, header_raw = request_line_and_possibly_headers
 
-            parsed_header_entries = []
-            for entry in header_entries.split(self.CRLF):
-                entry_parts = entry.split(self.COLON, maxsplit=1)
+            ok, header = self.__parse_header(header_raw)
+            if not ok:
+                return self.__response
 
-                # Each header name must have a corresponding value
-                if len(entry_parts) != 2:
-                    return self.CRLF.join((b'HTTP/1.1 400 Bad message syntax', self.CRLF))
-
-                parsed_header_entries.append(entry_parts)
-
-            header = dict(parsed_header_entries)
-            self.__logger.debug(f'Header:\n{header}')
-
+        # No header
         else:
             request_line = request_line_and_possibly_headers
 
-        return response
+        self.__logger.debug(
+            f'Request line:\n{request_line}\nHeader:\n{header}\nBody (if any):\n{body}')
+
+        ok, method, request_uri, http_version = self.__parse_request_line(
+            request_line)
+        if not ok:
+            return self.__response
+
+        # Only handle supported methods
+        if method not in self.__method_handlers:
+            return self.__response.set_status(HTTPStatus.METHOD_NOT_ALLOWED)
+
+        return self.__method_handlers[method](request_uri, http_version, header, body)
+
+    def __parse_request_line(self, request_line: bytes) -> Tuple:
+        expected_line_parts_length = 3
+        request_line_parts = request_line.split(self.SP)
+
+        if len(request_line_parts) != expected_line_parts_length:
+            self.__response.set_status(HTTPStatus.BAD_REQUEST)
+            return False, None, None, None
+
+        method, request_uri, http_version = request_line_parts
+
+        # Validate URI
+        parsed_uri = None
+        try:
+            parsed_uri = urlparse(request_uri)
+        except Exception as e:
+            self.__logger.exception(e)
+            self.__response.set_status(HTTPStatus.BAD_REQUEST)
+            return False, None, None, None
+
+        # Validate HTTP version
+        if http_version not in self.SUPPORTED_HTTP_VERSIONS:
+            self.__response.set_status(HTTPStatus.HTTP_VERSION_NOT_SUPPORTED)
+            return False, None, None, None
+
+        return True, method, parsed_uri, http_version
+
+    def __parse_header(self, header: bytes) -> Tuple:
+        parsed_header_entries = []
+        for entry in header.split(self.CRLF):
+            entry_parts = [part.strip()
+                           for part in entry.split(self.COLON, maxsplit=1)]
+
+            # Each header name must have a corresponding value
+            if len(entry_parts) != 2:
+                self.__response.set_status(HTTPStatus.BAD_REQUEST)
+                return False, None
+
+            parsed_header_entries.append(entry_parts)
+
+        return True, dict(parsed_header_entries)
+
+    def __handle_get(self, request_uri: bytes, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> bytes:
+        ...
 
 
 class MyWebServer(socketserver.BaseRequestHandler):
@@ -111,7 +185,6 @@ class MyWebServer(socketserver.BaseRequestHandler):
             self.MAX_CLIENT_MESSAGE_LENGTH_BYTES).strip()
         httpServer = HttpServer(client_data)
         self.request.sendall(httpServer.handle())
-        # self.request.sendall(bytearray("OK", 'utf-8'))
 
 
 if __name__ == "__main__":
@@ -122,7 +195,7 @@ if __name__ == "__main__":
     server = socketserver.TCPServer((HOST, PORT), MyWebServer)
 
     logging.basicConfig(
-        level=logging.DEBUG, format='[%(levelname)s - %(asctime)s - %(name)s - %(lineno)d] %(message)s')
+        level=logging.DEBUG, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
 
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
