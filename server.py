@@ -1,8 +1,9 @@
+from enum import IntEnum
+from pathlib import Path
 import socketserver
-from http import HTTPStatus
 from typing import Optional, Tuple
 from charset_normalizer import logging
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse, unquote
 #  coding: utf-8
 
 # Copyright 2022 Dillon Allan
@@ -32,11 +33,29 @@ from urllib.parse import urlparse
 # try: curl -v -X GET http://127.0.0.1:8080/
 
 
+class HttpStatus(IntEnum):
+    def __new__(cls, value, phrase):
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.phrase = phrase
+        return obj
+
+    OK = (200, 'OK')
+
+    BAD_REQUEST = (400, 'Bad Request')
+    NOT_FOUND = (404, 'Not Found')
+    METHOD_NOT_ALLOWED = (405, 'Method Not Allowed')
+    IM_A_TEAPOT = (418, "I'm a teapot")
+
+    HTTP_VERSION_NOT_SUPPORTED = (505, 'HTTP Version Not Supported')
+
+
 class HttpServer():
     '''A web server supporting a subset of the RFC 2616 HTTP/1.1 specification.'''
     ENCODING = 'UTF-8'
+    SERVER_ROOT = 'www'
     HTTP_VERSION = b'HTTP/1.1'
-    SUPPORTED_HTTP_VERSIONS = (HTTP_VERSION, b'HTTP/1.0')
+    SUPPORTED_HTTP_VERSIONS = (b'HTTP/1.0', b'HTTP/1.1')
     CRLF = b'\r\n'
     CRLF_CRLF = CRLF*2
     SP = b' '
@@ -51,7 +70,7 @@ class HttpServer():
             self.__header = {'Connection': 'close'}
             self.__body = b''
 
-        def set_status(self, status: HTTPStatus) -> 'HttpResponse':
+        def set_status(self, status: HttpStatus) -> 'HttpResponse':
             self.__status_parts = [
                 bytes(str(status.value), self.__encoding),
                 bytes(status.phrase, self.__encoding)
@@ -70,11 +89,18 @@ class HttpServer():
             response_bytes = HttpServer.CRLF.join(
                 [response_line, header_bytes, self.__body])
 
-            self.__logger.debug(f'Response:\n{response_bytes}')
+            self.__logger.info(f'Response:\n{response_bytes}')
             return response_bytes
 
     def __init__(self, client_data: bytes):
         self.__logger = logging.getLogger(HttpServer.__name__)
+        try:
+            self.__server_root = (
+                Path(__file__).parent / Path(HttpServer.SERVER_ROOT)).resolve(strict=True)
+        except Exception as e:
+            self.__logger.exception(e)
+            raise ValueError from e
+
         self.__client_data = client_data
         self.__method_handlers = {
             b'GET': self.__handle_get
@@ -96,13 +122,13 @@ class HttpServer():
 
         # Improper use of CRLF is not allowed
         if len(request_and_possibly_body) > 2:
-            return self.__response.set_status(HTTPStatus.BAD_REQUEST).to_bytes()
+            return self.__response.set_status(HttpStatus.BAD_REQUEST).to_bytes()
 
         return self.__handle_request(*request_and_possibly_body).to_bytes()
 
     def __handle_request(self, request: bytes, body: Optional[bytes] = None) -> 'HttpResponse':
         request_line = b''
-        header = {}
+        header = None
         request_line_and_possibly_headers = request.split(
             self.CRLF, maxsplit=1)
 
@@ -116,9 +142,9 @@ class HttpServer():
 
         # No header
         else:
-            request_line = request_line_and_possibly_headers
+            request_line = request_line_and_possibly_headers[0]
 
-        self.__logger.debug(
+        self.__logger.info(
             f'Request line:\n{request_line}\nHeader:\n{header}\nBody (if any):\n{body}')
 
         ok, method, request_uri, http_version = self.__parse_request_line(
@@ -128,7 +154,7 @@ class HttpServer():
 
         # Only handle supported methods
         if method not in self.__method_handlers:
-            return self.__response.set_status(HTTPStatus.METHOD_NOT_ALLOWED)
+            return self.__response.set_status(HttpStatus.METHOD_NOT_ALLOWED)
 
         return self.__method_handlers[method](request_uri, http_version, header, body)
 
@@ -137,7 +163,7 @@ class HttpServer():
         request_line_parts = request_line.split(self.SP)
 
         if len(request_line_parts) != expected_line_parts_length:
-            self.__response.set_status(HTTPStatus.BAD_REQUEST)
+            self.__response.set_status(HttpStatus.BAD_REQUEST)
             return False, None, None, None
 
         method, request_uri, http_version = request_line_parts
@@ -148,12 +174,12 @@ class HttpServer():
             parsed_uri = urlparse(request_uri)
         except Exception as e:
             self.__logger.exception(e)
-            self.__response.set_status(HTTPStatus.BAD_REQUEST)
+            self.__response.set_status(HttpStatus.BAD_REQUEST)
             return False, None, None, None
 
         # Validate HTTP version
         if http_version not in self.SUPPORTED_HTTP_VERSIONS:
-            self.__response.set_status(HTTPStatus.HTTP_VERSION_NOT_SUPPORTED)
+            self.__response.set_status(HttpStatus.HTTP_VERSION_NOT_SUPPORTED)
             return False, None, None, None
 
         return True, method, parsed_uri, http_version
@@ -166,15 +192,34 @@ class HttpServer():
 
             # Each header name must have a corresponding value
             if len(entry_parts) != 2:
-                self.__response.set_status(HTTPStatus.BAD_REQUEST)
+                self.__response.set_status(HttpStatus.BAD_REQUEST)
                 return False, None
 
             parsed_header_entries.append(entry_parts)
 
         return True, dict(parsed_header_entries)
 
-    def __handle_get(self, request_uri: bytes, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> bytes:
-        ...
+    def __handle_get(self, request_uri: ParseResult, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> 'HttpResponse':
+        # Test that request URI is both
+        # a. a descendent of the server root, and
+        # b. pointing to an actual resource.
+        unquoted_uri_path = unquote(
+            str(request_uri.path, encoding=self.ENCODING), encoding=self.ENCODING).lstrip('/')
+        uri_path_relative_to_server_root = self.__server_root / \
+            Path(unquoted_uri_path)
+        uri_path_absolute = None
+        try:
+            uri_path_absolute = uri_path_relative_to_server_root.resolve(
+                strict=True)
+        except (FileNotFoundError, RuntimeError) as e:
+            self.__logger.exception(e)
+        finally:
+            if uri_path_absolute is None or self.__server_root not in uri_path_absolute.parents:
+                return self.__response.set_status(HttpStatus.NOT_FOUND)
+
+        # TODO: check for missing trailing '/'
+
+        return self.__response.set_status(HttpStatus.IM_A_TEAPOT)
 
 
 class MyWebServer(socketserver.BaseRequestHandler):
@@ -191,7 +236,7 @@ if __name__ == "__main__":
     HOST, PORT = "localhost", 8080
 
     socketserver.TCPServer.allow_reuse_address = True
-    # Create the server, binding to localhost on port 8080
+    # Create the server, binding to HOST on port PORT
     server = socketserver.TCPServer((HOST, PORT), MyWebServer)
 
     logging.basicConfig(
