@@ -37,7 +37,7 @@ from urllib.parse import ParseResult, urlparse, unquote
 
 class HttpStatus(IntEnum):
     '''
-    The few HTTP Status codes supported by HttpServer. 
+    The few HTTP Status codes supported by HttpServer.
 
     Design inspired by http.HTTPStatus.
 
@@ -52,6 +52,8 @@ class HttpStatus(IntEnum):
         return obj
 
     OK = (200, 'OK')
+
+    MOVED_PERMANENTLY = (301, 'Moved Permanently')
 
     BAD_REQUEST = (400, 'Bad Request')
     NOT_FOUND = (404, 'Not Found')
@@ -78,7 +80,9 @@ class HttpServer():
     CRLF_CRLF = CRLF*2
     SP = b' '
     COLON = b':'
+    SEP = b'/'
 
+    INDEX_FILE = Path('index.html')
     READ_CHUNKSIZE = 4092
 
     class HttpResponse:
@@ -228,13 +232,16 @@ class HttpServer():
         return True, dict(parsed_header_entries)
 
     def __handle_get(self, request_uri: ParseResult, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> 'HttpResponse':
+        unquoted_uri_path = unquote(
+            str(request_uri.path, encoding=self.ENCODING), encoding=self.ENCODING)
+        uri_has_trailing_slash = len(unquoted_uri_path) > 0 and \
+            bytes(unquoted_uri_path[-1], encoding=self.ENCODING) == self.SEP
+        uri_path_relative_to_server_root = self.__server_root / \
+            Path(unquoted_uri_path.lstrip(str(self.SEP, encoding=self.ENCODING)))
+
         # Test that request URI is both
         # a. a descendent of the server root, and
         # b. pointing to an actual resource.
-        unquoted_uri_path = unquote(
-            str(request_uri.path, encoding=self.ENCODING), encoding=self.ENCODING).lstrip('/')
-        uri_path_relative_to_server_root = self.__server_root / \
-            Path(unquoted_uri_path)
         uri_path_absolute = None
         try:
             uri_path_absolute = uri_path_relative_to_server_root.resolve(
@@ -242,10 +249,22 @@ class HttpServer():
         except (FileNotFoundError, RuntimeError) as e:
             self.__logger.exception(e)
         finally:
-            if uri_path_absolute is None or self.__server_root not in uri_path_absolute.parents:
+            if uri_path_absolute is None or \
+                    (self.__server_root != uri_path_absolute and self.__server_root not in uri_path_absolute.parents):
                 return self.__response.set_status(HttpStatus.NOT_FOUND)
 
-        # TODO: check for missing trailing '/' ????
+        if uri_path_absolute.is_dir():
+            # serve default file in a directory
+            if uri_has_trailing_slash:
+                uri_path_absolute /= self.INDEX_FILE
+
+            # Missing trailing separator: redirect to proper URL
+            else:
+                new_uri = request_uri._replace(scheme=b'http', netloc=header.get(b'Host'),
+                                               path=request_uri.path + self.SEP).geturl()
+                location_header = {b'Location': new_uri}
+                return self.__response.set_status(HttpStatus.MOVED_PERMANENTLY).update_header(location_header)
+
         if not uri_path_absolute.exists():
             return self.__response.set_status(HttpStatus.NOT_FOUND)
 
@@ -258,7 +277,6 @@ class HttpServer():
             b'Content-Length': bytes(str(uri_path_absolute.stat().st_size), encoding=self.ENCODING)}
         # TODO: set Date and Last Modified header fields
         response_headers_to_add = {**content_type, **content_length}
-        self.__response.update_header(response_headers_to_add)
 
         # Load resource into body
         body_buffer = b''
@@ -267,9 +285,10 @@ class HttpServer():
             while chunk:
                 body_buffer = b''.join([body_buffer, chunk])
                 chunk = resource.read(self.READ_CHUNKSIZE)
-        self.__response.set_body(body_buffer)
 
-        return self.__response.set_status(HttpStatus.OK)
+        return self.__response.set_status(HttpStatus.OK) \
+            .update_header(response_headers_to_add) \
+            .set_body(body_buffer)
 
 
 class MyWebServer(socketserver.BaseRequestHandler):
@@ -291,6 +310,7 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=logging.DEBUG, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
+    logging.disable(logging.ERROR)
 
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
