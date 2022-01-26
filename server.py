@@ -335,7 +335,7 @@ if __name__ == "__main__":
 
     # Set log level to desired verbosity
     logging.basicConfig(
-        level=logging.INFO, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
+        level=logging.CRITICAL, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
 
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
