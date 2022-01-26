@@ -1,5 +1,7 @@
 from enum import IntEnum
 from pathlib import Path
+import mimetypes
+import platform
 import socketserver
 from typing import Optional, Tuple
 from charset_normalizer import logging
@@ -34,6 +36,11 @@ from urllib.parse import ParseResult, urlparse, unquote
 
 
 class HttpStatus(IntEnum):
+    '''
+    The few HTTP Status codes supported by HttpServer. 
+
+    Design inspired by http.HTTPStatus. TODO: add citation
+    '''
     def __new__(cls, value, phrase):
         obj = int.__new__(cls, value)
         obj._value_ = value
@@ -56,10 +63,19 @@ class HttpServer():
     SERVER_ROOT = 'www'
     HTTP_VERSION = b'HTTP/1.1'
     SUPPORTED_HTTP_VERSIONS = (b'HTTP/1.0', b'HTTP/1.1')
+
+    # Common MIME types by Mozilla Contributors is licensed under CC-BY-SA 2.5
+    # https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types,
+    # Accessed 2022-01-25
+    DEFAULT_MIME_TYPE = b'application/octet-stream'
+    DEFAULT_CHARSET = b'charset=utf-8'
+
     CRLF = b'\r\n'
     CRLF_CRLF = CRLF*2
     SP = b' '
     COLON = b':'
+
+    READ_CHUNKSIZE = 4092
 
     class HttpResponse:
         '''Helper class for crafting responses based on the design of HttpServer.'''
@@ -67,7 +83,8 @@ class HttpServer():
         def __init__(self):
             self.__logger = logging.getLogger(HttpServer.HttpResponse.__name__)
             self.__encoding = HttpServer.ENCODING
-            self.__header = {'Connection': 'close'}
+            self.__header = {b'Connection': b'close',
+                             b'Server': bytes(f'{HttpServer.__name__}/0.1 Python/{platform.python_version()}', encoding=self.__encoding)}
             self.__body = b''
 
         def set_status(self, status: HttpStatus) -> 'HttpResponse':
@@ -77,14 +94,21 @@ class HttpServer():
             ]
             return self
 
+        def update_header(self, fields_to_add: dict) -> 'HttpResponse':
+            self.__header.update(fields_to_add)
+            return self
+
+        def set_body(self, body: bytes) -> 'HttpResponse':
+            self.__body = body
+            return self
+
         def to_bytes(self) -> bytes:
             response_line = HttpServer.SP.join(
                 [HttpServer.HTTP_VERSION, *self.__status_parts])
 
             header_bytes = HttpServer.CRLF.join(
-                [bytes(f'{name}: {val}', encoding=HttpServer.ENCODING)
-                 for name, val in self.__header.items()]
-            )
+                [b': '.join([name, val]) for name, val in self.__header.items()])
+            header_bytes += HttpServer.CRLF
 
             response_bytes = HttpServer.CRLF.join(
                 [response_line, header_bytes, self.__body])
@@ -217,9 +241,31 @@ class HttpServer():
             if uri_path_absolute is None or self.__server_root not in uri_path_absolute.parents:
                 return self.__response.set_status(HttpStatus.NOT_FOUND)
 
-        # TODO: check for missing trailing '/'
+        # TODO: check for missing trailing '/' ????
+        if not uri_path_absolute.exists():
+            return self.__response.set_status(HttpStatus.NOT_FOUND)
 
-        return self.__response.set_status(HttpStatus.IM_A_TEAPOT)
+        # Set metadata for the resource
+        mime_type, file_charset = mimetypes.guess_type(uri_path_absolute)
+        content_type = {b'Content-Type': b';'.join(
+            [bytes(mime_type, self.ENCODING) if mime_type else self.DEFAULT_MIME_TYPE,
+             bytes(file_charset, self.ENCODING) if file_charset else self.DEFAULT_CHARSET])}
+        content_length = {
+            b'Content-Length': bytes(str(uri_path_absolute.stat().st_size), encoding=self.ENCODING)}
+        # TODO: set Date and Last Modified header fields
+        response_headers_to_add = {**content_type, **content_length}
+        self.__response.update_header(response_headers_to_add)
+
+        # Load resource into body
+        body_buffer = b''
+        with open(uri_path_absolute, mode='rb') as resource:
+            chunk = resource.read(self.READ_CHUNKSIZE)
+            while chunk:
+                body_buffer = b''.join([body_buffer, chunk])
+                chunk = resource.read(self.READ_CHUNKSIZE)
+        self.__response.set_body(body_buffer)
+
+        return self.__response.set_status(HttpStatus.OK)
 
 
 class MyWebServer(socketserver.BaseRequestHandler):
