@@ -39,7 +39,11 @@ class HttpStatus(IntEnum):
     '''
     The few HTTP Status codes supported by HttpServer. 
 
-    Design inspired by http.HTTPStatus. TODO: add citation
+    Design inspired by http.HTTPStatus.
+
+    class http.HTTPStatus by the Python Software foundation is licensed under the Python Software Foundation License Version 2.
+    https://docs.python.org/3/library/http.html#http.HTTPStatus
+    Accessed 2022-01-26.
     '''
     def __new__(cls, value, phrase):
         obj = int.__new__(cls, value)
