@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 import mimetypes
@@ -56,7 +57,7 @@ class HttpStatus(IntEnum):
     MOVED_PERMANENTLY = (301, 'Moved Permanently')
 
     BAD_REQUEST = (400, 'Bad Request')
-    NOT_FOUND = (404, 'Not Found')
+    NOT_FOUND = (404, 'File not found')
     METHOD_NOT_ALLOWED = (405, 'Method Not Allowed')
     IM_A_TEAPOT = (418, "I'm a teapot")
 
@@ -69,6 +70,11 @@ class HttpServer():
     SERVER_ROOT = 'www'
     HTTP_VERSION = b'HTTP/1.1'
     SUPPORTED_HTTP_VERSIONS = (b'HTTP/1.0', b'HTTP/1.1')
+
+    # RFC 1123 Date Representation in Python? posted by Sebastian Rittau and answered by Florian Bösch is licensed under CC-BY-SA 2.5
+    # https://stackoverflow.com/a/225106
+    # Accessed 2022-01-26
+    RFC_1123_DATE_FORMAT = '%a, %d %b %Y %H:%M:%S GMT'
 
     # Common MIME types by Mozilla Contributors is licensed under CC-BY-SA 2.5
     # https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types,
@@ -268,14 +274,25 @@ class HttpServer():
 
     def __set_resource_headers(self, uri_path: Path) -> 'HttpResponse':
         mime_type, file_charset = mimetypes.guess_type(uri_path)
+        resource_stats = uri_path.stat()
         content_type = {b'Content-Type': b';'.join(
             [bytes(mime_type, self.ENCODING) if mime_type else self.DEFAULT_MIME_TYPE,
              bytes(file_charset, self.ENCODING) if file_charset else self.DEFAULT_CHARSET])}
         content_length = {
-            b'Content-Length': bytes(str(uri_path.stat().st_size), encoding=self.ENCODING)}
-        # TODO: set Date and Last Modified header fields
+            b'Content-Length': bytes(
+                str(resource_stats.st_size), encoding=self.ENCODING
+            )}
+        last_modified = {
+            b'Last-Modified': bytes(
+                datetime.utcfromtimestamp(resource_stats.st_mtime).strftime(
+                    self.RFC_1123_DATE_FORMAT),
+                encoding=self.ENCODING
+            )}
+        date_field = {
+            b'Date': bytes(datetime.utcnow().strftime(self.RFC_1123_DATE_FORMAT), encoding=self.ENCODING)
+        }
 
-        return self.__response.update_header({**content_type, **content_length})
+        return self.__response.update_header({**content_type, **content_length, **last_modified, **date_field})
 
     def __set_body(self, uri_path: Path) -> 'HttpResponse':
         # Load resource into body
@@ -316,8 +333,9 @@ if __name__ == "__main__":
     # Create the server, binding to HOST on port PORT
     server = socketserver.TCPServer((HOST, PORT), MyWebServer)
 
+    # Set log level to desired verbosity
     logging.basicConfig(
-        level=logging.CRITICAL, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
+        level=logging.INFO, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
 
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
