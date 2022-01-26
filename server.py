@@ -168,7 +168,7 @@ class HttpServer():
         if len(request_line_and_possibly_headers) == 2:
             request_line, header_raw = request_line_and_possibly_headers
 
-            ok, header = self.__parse_header(header_raw)
+            ok, self.__response, header = self.__parse_header(header_raw)
             if not ok:
                 return self.__response
 
@@ -179,7 +179,7 @@ class HttpServer():
         self.__logger.info(
             f'Request line:\n{request_line}\nHeader:\n{header}\nBody (if any):\n{body}')
 
-        ok, method, request_uri, http_version = self.__parse_request_line(
+        ok, self.__response, method, request_uri, http_version = self.__parse_request_line(
             request_line)
         if not ok:
             return self.__response
@@ -195,8 +195,7 @@ class HttpServer():
         request_line_parts = request_line.split(self.SP)
 
         if len(request_line_parts) != expected_line_parts_length:
-            self.__response.set_status(HttpStatus.BAD_REQUEST)
-            return False, None, None, None
+            return False, self.__response.set_status(HttpStatus.BAD_REQUEST), None, None, None
 
         method, request_uri, http_version = request_line_parts
 
@@ -206,15 +205,13 @@ class HttpServer():
             parsed_uri = urlparse(request_uri)
         except Exception as e:
             self.__logger.exception(e)
-            self.__response.set_status(HttpStatus.BAD_REQUEST)
-            return False, None, None, None
+            return False, self.__response.set_status(HttpStatus.BAD_REQUEST), None, None, None
 
         # Validate HTTP version
         if http_version not in self.SUPPORTED_HTTP_VERSIONS:
-            self.__response.set_status(HttpStatus.HTTP_VERSION_NOT_SUPPORTED)
-            return False, None, None, None
+            return False, self.__response.set_status(HttpStatus.HTTP_VERSION_NOT_SUPPORTED), None, None, None
 
-        return True, method, parsed_uri, http_version
+        return True, self.__response, method, parsed_uri, http_version
 
     def __parse_header(self, header: bytes) -> Tuple:
         parsed_header_entries = []
@@ -224,16 +221,15 @@ class HttpServer():
 
             # Each header name must have a corresponding value
             if len(entry_parts) != 2:
-                self.__response.set_status(HttpStatus.BAD_REQUEST)
-                return False, None
+                return False, self.__response.set_status(HttpStatus.BAD_REQUEST), None
 
             parsed_header_entries.append(entry_parts)
 
-        return True, dict(parsed_header_entries)
+        return True, self.__response, dict(parsed_header_entries)
 
-    def __handle_get(self, request_uri: ParseResult, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> 'HttpResponse':
+    def __validate_request_uri(self, uri: ParseResult, header: dict) -> Tuple:
         unquoted_uri_path = unquote(
-            str(request_uri.path, encoding=self.ENCODING), encoding=self.ENCODING)
+            str(uri.path, encoding=self.ENCODING), encoding=self.ENCODING)
         uri_has_trailing_slash = len(unquoted_uri_path) > 0 and \
             bytes(unquoted_uri_path[-1], encoding=self.ENCODING) == self.SEP
         uri_path_relative_to_server_root = self.__server_root / \
@@ -251,7 +247,7 @@ class HttpServer():
         finally:
             if uri_path_absolute is None or \
                     (self.__server_root != uri_path_absolute and self.__server_root not in uri_path_absolute.parents):
-                return self.__response.set_status(HttpStatus.NOT_FOUND)
+                return False, self.__response.set_status(HttpStatus.NOT_FOUND), None
 
         if uri_path_absolute.is_dir():
             # serve default file in a directory
@@ -260,35 +256,47 @@ class HttpServer():
 
             # Missing trailing separator: redirect to proper URL
             else:
-                new_uri = request_uri._replace(scheme=b'http', netloc=header.get(b'Host'),
-                                               path=request_uri.path + self.SEP).geturl()
+                new_uri = uri._replace(scheme=b'http', netloc=header.get(b'Host'),
+                                       path=uri.path + self.SEP).geturl()
                 location_header = {b'Location': new_uri}
-                return self.__response.set_status(HttpStatus.MOVED_PERMANENTLY).update_header(location_header)
+                return False, self.__response.set_status(HttpStatus.MOVED_PERMANENTLY).update_header(location_header), None
 
         if not uri_path_absolute.exists():
-            return self.__response.set_status(HttpStatus.NOT_FOUND)
+            return False, self.__response.set_status(HttpStatus.NOT_FOUND), None
 
-        # Set metadata for the resource
-        mime_type, file_charset = mimetypes.guess_type(uri_path_absolute)
+        return True, self.__response, uri_path_absolute
+
+    def __set_resource_headers(self, uri_path: Path) -> 'HttpResponse':
+        mime_type, file_charset = mimetypes.guess_type(uri_path)
         content_type = {b'Content-Type': b';'.join(
             [bytes(mime_type, self.ENCODING) if mime_type else self.DEFAULT_MIME_TYPE,
              bytes(file_charset, self.ENCODING) if file_charset else self.DEFAULT_CHARSET])}
         content_length = {
-            b'Content-Length': bytes(str(uri_path_absolute.stat().st_size), encoding=self.ENCODING)}
+            b'Content-Length': bytes(str(uri_path.stat().st_size), encoding=self.ENCODING)}
         # TODO: set Date and Last Modified header fields
-        response_headers_to_add = {**content_type, **content_length}
 
+        return self.__response.update_header({**content_type, **content_length})
+
+    def __set_body(self, uri_path: Path) -> 'HttpResponse':
         # Load resource into body
         body_buffer = b''
-        with open(uri_path_absolute, mode='rb') as resource:
+        with open(uri_path, mode='rb') as resource:
             chunk = resource.read(self.READ_CHUNKSIZE)
             while chunk:
                 body_buffer = b''.join([body_buffer, chunk])
                 chunk = resource.read(self.READ_CHUNKSIZE)
+        return self.__response.set_body(body_buffer)
 
-        return self.__response.set_status(HttpStatus.OK) \
-            .update_header(response_headers_to_add) \
-            .set_body(body_buffer)
+    def __handle_get(self, request_uri: ParseResult, request_http_version: bytes, header: dict, body: Optional[bytes] = None) -> 'HttpResponse':
+        ok, self.__response, uri_path_absolute = self.__validate_request_uri(
+            request_uri, header)
+        if not ok:
+            return self.__response
+
+        self.__response = self.__set_resource_headers(uri_path_absolute)
+        self.__response = self.__set_body(uri_path_absolute)
+
+        return self.__response.set_status(HttpStatus.OK)
 
 
 class MyWebServer(socketserver.BaseRequestHandler):
@@ -309,8 +317,7 @@ if __name__ == "__main__":
     server = socketserver.TCPServer((HOST, PORT), MyWebServer)
 
     logging.basicConfig(
-        level=logging.DEBUG, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
-    logging.disable(logging.ERROR)
+        level=logging.CRITICAL, format='[%(levelname)s - %(asctime)s - %(name)s] %(message)s')
 
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
